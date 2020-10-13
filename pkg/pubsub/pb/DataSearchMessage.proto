@@ -1,0 +1,25 @@
+syntax = "proto2";
+
+package pubsub.pb;
+
+
+enum MessageType {
+    REQUEST = 0;
+    RESPONSE = 1;
+}
+
+message TransferMessage {
+    required MessageType type = 1;
+    optional QueryMessage qMsg = 2;
+    optional ResponseMessage rMsg = 3;
+    optional string inner_id = 4;
+}
+message QueryMessage {
+    required int32 steps = 1 [default = 0];
+    required bytes request = 2;
+}
+
+message ResponseMessage {
+    required string requestID = 1;
+    required bytes response = 2;
+}
