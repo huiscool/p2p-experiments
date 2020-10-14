@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"math/rand"
 	"strconv"
 	"time"
@@ -35,6 +34,7 @@ var (
 	ClearCacheDuration        = CacheDuration * 2
 	WaitResponseTime          = 2 * time.Second //等待孩子节点的返回时间
 	PlumtreeHeartbeatInterval = 5 * time.Second
+	PullTimeout               = 500 * time.Millisecond //在这段时间内等待父节点的消息，如果没收到，则从ihave的节点里面拉取
 	StepsOptimization         = false
 	StepOptThreshold          = 2 //跳数优化阈值，相差>2 需要优化
 )
@@ -141,7 +141,6 @@ func (pr *PlumtreeRouter) HandleRPC(rpc *RPC) {
 }
 
 func (pr *PlumtreeRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) ([]*pb.ControlIWant, []*pb.ControlGraft) {
-	rTime := time.Now().Unix()
 	var iwant, graft []string
 	for _, iHave := range ctl.GetIhave() {
 		pr.log.Debug("handling IHave")
@@ -153,63 +152,30 @@ func (pr *PlumtreeRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) ([]*pb.
 		//数组的大小，始终为1，因为要兼容之前的消息类型
 		for _, msgID := range iHave.GetMessageIDs() {
 			//TODO:根据节点的跳数做优化，仅在节点数量多，且查询的数据量很大的情况下用。后续再实现
-			select {
-			//500ms收不到消息ID对应的消息，需要主动请求
-			case <-time.After(500 * time.Millisecond):
+			// 这里需要异步，避免阻塞pubsub主流程
+			go func(p peer.ID, msgID string) {
+				<-time.After(PullTimeout)
 				if !pr.p.seenMessages.Has(msgID) {
-					pr.log.Info("sending request to regain message, ", msgID)
+					pr.log.Infof("not seen timeout: from=%s msgid=%s", p.ShortString(), msgID)
 					iwant = append(iwant, msgID)
 					graft = append(graft, topic)
 
 					ePeers := pr.EagerPeers[topic]
 					lPeers := pr.LazyPeers[topic]
-					if _, ok := ePeers[p]; ok {
-						// do nothing
-					} else {
-						//eager list does not contain this peer
-						pr.log.Debugf("GRAFT: Add tree link from %s in %s", p, topic)
-						ePeers[p] = struct{}{}
-						pr.tagPeer(p, topic)
-						if _, ok := lPeers[p]; ok {
-							delete(lPeers, p)
-						}
-					}
-				} else {
-					if !StepsOptimization {
-						continue
-					}
-					//消息的接收在IHAVE收到后的500ms内，或IHAVE之前
-					item, ok := pr.EagerReceivedTime.Get(msgID)
-					if !ok {
-						pr.log.Warningf("%s message not in map ", msgID)
-						continue
-					}
-					eRtime := item.(int64)
-					timeDiff := math.Abs(float64(eRtime - rTime))
-					if timeDiff < 200 {
-						//差值在200ms以内，才考虑跳数优化
-						cMsg, ok := pr.CacheMessage.Get(msgID)
-						if !ok {
-							continue
-						}
-						tmpMsg := pb.TransferMessage{}
-						err2 := proto.Unmarshal(cMsg.(*pb.Message).Data, &tmpMsg)
-						if err2 != nil {
-							continue
-						}
-						diff := *tmpMsg.QMsg.Steps - *iHave.Steps
-						if diff > int32(StepOptThreshold) {
-							graft = append(graft, topic)
-							pr.log.Debugf("GRAFT: Add tree link from %s in %s", p, topic)
-							pr.EagerPeers[topic][p] = struct{}{}
+					if _, ok := ePeers[p]; !ok {
+						// 需要放到eval里面避免并发修改map
+						pr.p.eval <- func() {
+							//eager list does not contain this peer
+							pr.log.Infof("GRAFT: to %s", p.ShortString())
+							ePeers[p] = struct{}{}
 							pr.tagPeer(p, topic)
-							if _, ok := pr.LazyPeers[topic][p]; ok {
-								delete(pr.LazyPeers[topic], p)
+							if _, ok := lPeers[p]; ok {
+								delete(lPeers, p)
 							}
 						}
 					}
 				}
-			}
+			}(p, msgID)
 		}
 	}
 	if len(iwant) == 0 && len(graft) == 0 {
@@ -237,8 +203,7 @@ func (pr *PlumtreeRouter) handlePrune(p peer.ID, ctl *pb.ControlMessage) {
 		peers, ok := pr.EagerPeers[topic]
 		lPeers := pr.LazyPeers[topic]
 		if ok {
-			pr.log.Debugf("PRUNE : Remove Eager Link from %s to %s \n", pr.getNoFromID(p.String()), pr.getNoFromID(pr.p.host.ID().String()))
-			pr.log.Debugf("PRUNE:Remove eager link to %s in %s", p, topic)
+			pr.log.Infof("PRUNE to %s \n", p.ShortString())
 			delete(peers, p)
 			lPeers[p] = struct{}{}
 		}
@@ -259,7 +224,7 @@ func (pr *PlumtreeRouter) handleGraft(p peer.ID, ctl *pb.ControlMessage) []*pb.C
 			if _, ok := ePeers[p]; ok {
 				// do nothing
 			} else {
-				pr.log.Debugf("GRAFT: Add tree link from %s in %s", p, topic)
+				pr.log.Infof("GRAFT: to %s", p.ShortString())
 				//eager list does not contain this peer
 				ePeers[p] = struct{}{}
 				pr.tagPeer(p, topic)
@@ -344,7 +309,7 @@ func (pr *PlumtreeRouter) heartbeat() {
 			_, ok1 := pr.EagerPeers[topic][pid]
 			_, ok2 := pr.LazyPeers[topic][pid]
 			if !ok1 && !ok2 {
-				pr.log.Debugf("Heartbeat fix view: Add link to %s in %s", pid, topic)
+				pr.log.Infof("Heartbeat fix view: Add link to %s in %s", pid, topic)
 				pr.EagerPeers[topic][pid] = struct{}{}
 				pr.tagPeer(pid, topic)
 				pr.sendGraft(pid, topic)
@@ -372,7 +337,7 @@ func (pr *PlumtreeRouter) Publish(from peer.ID, msg *pb.Message) {
 			return
 		}
 		if *tMessage.Type == pb.MessageType_RESPONSE {
-			pr.log.Debugf("received a response message from children %s \n", from.ShortString())
+			pr.log.Debugf("received response: from=%s msgid=%s", from.ShortString(), msgID(msg))
 			rid := tMessage.GetRMsg().GetRequestID()
 			if rid == "" {
 				pr.log.Warning("invalid RequestID")
@@ -463,7 +428,7 @@ func (pr *PlumtreeRouter) sendResponseToUser(topic string, msgID string) {
 	if !ok {
 		pr.log.Errorf("cannot get time cost for %s", msgID)
 	}
-	pr.log.Infof("Time cost is :%s \n", time.Now().Sub(tmp.(time.Time)))
+	pr.log.Warnf("Time cost is: %s\n", time.Now().Sub(tmp.(time.Time)))
 
 	fatherNode, ok := pr.fatherMap.Get(msgID)
 	if !ok {

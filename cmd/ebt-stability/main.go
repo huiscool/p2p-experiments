@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	crand "crypto/rand"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"math/rand"
@@ -12,11 +13,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gogo/protobuf/proto"
 	pubsub "github.com/huiscool/p2p-experiments/pkg/pubsub"
-	pb "github.com/huiscool/p2p-experiments/pkg/pubsub/pb"
 	logging "github.com/ipfs/go-log"
-	uuid "github.com/nu7hatch/gouuid"
 
 	crypto "github.com/libp2p/go-libp2p-core/crypto"
 	host "github.com/libp2p/go-libp2p-core/host"
@@ -56,6 +54,50 @@ var (
 type Node struct {
 	Host   host.Host
 	PubSub *pubsub.PubSub
+	Router *pubsub.PlumtreeRouter
+}
+
+// Processor .
+type Processor struct{}
+type Request = pubsub.Request
+type Response = pubsub.Response
+
+//RequestSerializer is invoked before publishing
+func (p *Processor) RequestSerializer(r Request) []byte {
+	out := make([]byte, 8)
+	binary.BigEndian.PutUint64(out, r.(uint64))
+	return out
+}
+
+//RequestUnserializer is invoked when a host receive Request
+func (p *Processor) RequestUnserializer(stream []byte) Request {
+	return binary.BigEndian.Uint64(stream)
+}
+
+//ResponseSerializer .
+func (p *Processor) ResponseSerializer(r Response) []byte {
+	out := make([]byte, 8)
+	binary.BigEndian.PutUint64(out, r.(uint64))
+	return out
+}
+
+//ResponseUnserializer .
+func (p *Processor) ResponseUnserializer(stream []byte) Response {
+	return binary.BigEndian.Uint64(stream)
+}
+
+//RequestHandler deals with the request. Each host with get the same request.
+func (p *Processor) RequestHandler(r Request) Response {
+	return uint64(1)
+}
+
+//MergeResponseHandler tells the fetcher how to merge responses which contains local response. It is invoked when the host received all its children's responses.
+func (p *Processor) MergeResponseHandler(res []Response) Response {
+	out := uint64(0)
+	for _, r := range res {
+		out += r.(uint64)
+	}
+	return out
 }
 
 func main() {
@@ -65,14 +107,14 @@ func main() {
 
 	Num = flag.Int("num", 20, "")
 	Fanout = flag.Int("fanout", 3, "")
-	Concurrent = flag.Int("curr", 1, "")
+	Concurrent = flag.Int("concurrent", 1, "")
 	Latency = flag.Int("latency", 50, "")
 	Round = flag.Int("round", 10, "")
 	Interval = flag.Int("interval", 100, "")
 	flag.Parse()
 
 	logging.SetLogLevel("main", "info")
-	logging.SetLogLevel("pubsub", "info")
+	logging.SetLogLevel("pubsub", "warn")
 
 	// GenNet
 	GenNet(*Num, *Fanout, *Latency)
@@ -100,13 +142,15 @@ func GenNet(num int, fanout int, latency int) {
 		if err != nil {
 			panic(err)
 		}
-		psub, err := pubsub.NewPlumtreeSub(context.Background(), h)
+		rt := pubsub.NewPlumtreeRouter()
+		psub, err := pubsub.NewPubSub(context.Background(), h, rt)
 		if err != nil {
 			panic(err)
 		}
 		nodes[h.ID()] = Node{
 			Host:   h,
 			PubSub: psub,
+			Router: rt,
 		}
 	}
 
@@ -137,6 +181,8 @@ func GenNet(num int, fanout int, latency int) {
 	// subscribe for test topic
 	for _, pid := range allpeers {
 		psub := nodes[pid].PubSub
+		rt := nodes[pid].Router
+		rt.SetProcessor(&Processor{})
 		_, err := psub.Subscribe(topic)
 		if err != nil {
 			panic(err)
@@ -153,6 +199,8 @@ func Run(concurrent int, round int, interval int) {
 	var wg sync.WaitGroup
 	wg.Add(len(senders))
 	for _, pid := range senders {
+		// 随机化开始时间
+		time.Sleep(time.Duration(rand.Intn(100)) * time.Millisecond)
 		go Work(&wg, pid, round, interval)
 	}
 	wg.Wait()
@@ -161,27 +209,14 @@ func Run(concurrent int, round int, interval int) {
 
 // Work function performs concurrent broadcast for several rounds.
 func Work(wg *sync.WaitGroup, pid peer.ID, round int, interval int) {
-	psub := nodes[pid].PubSub
-	//marshal request
-	innerMsgID := generateUUID()
-	reqStep := int32(0)
-	transMsg := &pb.TransferMessage{
-		Type:    pb.MessageType_REQUEST.Enum(),
-		InnerId: &innerMsgID,
-		QMsg: &pb.QueryMessage{
-			Steps:   &reqStep,
-			Request: data,
-		},
-	}
-	bin, err := proto.Marshal(transMsg)
-	if err != nil {
-		panic(err)
-	}
+	rt := nodes[pid].Router
+
 	for i := 0; i < round; i++ {
-		err = psub.Publish(topic, bin)
+		resp, err := rt.PublishRequest(uint64(0), topic)
 		if err != nil {
 			panic(err)
 		}
+		log.Info(pid.ShortString(), ": recv ", resp.(uint64))
 		time.Sleep(time.Duration(interval) * time.Millisecond)
 	}
 
@@ -240,16 +275,4 @@ func GenPeerWithMarshalablePrivKey(mn mocknet.Mocknet) (host.Host, error) {
 	}
 
 	return h, nil
-}
-
-func generateUUID() string {
-	var id string
-	temp, err := uuid.NewV4()
-	if err != nil {
-		log.Fatal("generate uuid failed")
-		id = "abcde"
-	} else {
-		id = temp.String()
-	}
-	return id
 }
