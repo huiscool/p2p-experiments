@@ -3,6 +3,7 @@ package pubsub
 import (
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"math/rand"
 	"sync/atomic"
@@ -11,11 +12,11 @@ import (
 	pb "github.com/huiscool/p2p-experiments/pkg/pubsub/pb"
 
 	logging "github.com/ipfs/go-log"
-	"github.com/libp2p/go-libp2p-crypto"
-	"github.com/libp2p/go-libp2p-host"
+	crypto "github.com/libp2p/go-libp2p-core/crypto"
+	host "github.com/libp2p/go-libp2p-core/host"
+	peer "github.com/libp2p/go-libp2p-core/peer"
+	protocol "github.com/libp2p/go-libp2p-core/protocol"
 	inet "github.com/libp2p/go-libp2p-net"
-	"github.com/libp2p/go-libp2p-peer"
-	"github.com/libp2p/go-libp2p-protocol"
 	"github.com/whyrusleeping/timecache"
 )
 
@@ -648,7 +649,12 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 
 // msgID returns a unique ID of the passed Message
 func msgID(pmsg *pb.Message) string {
-	return string(pmsg.GetFrom()) + string(pmsg.GetSeqno())
+	from := pmsg.GetFrom()
+	seqno := pmsg.GetSeqno()
+	var bin []byte = make([]byte, 0, len(from)+len(seqno))
+	bin = append(bin, from...)
+	bin = append(bin, seqno...)
+	return hex.EncodeToString(bin)
 }
 
 // pushMsg pushes a message performing validation as necessary

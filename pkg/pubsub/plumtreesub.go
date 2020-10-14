@@ -11,6 +11,7 @@ import (
 
 	"github.com/gogo/protobuf/proto"
 	pb "github.com/huiscool/p2p-experiments/pkg/pubsub/pb"
+	logging "github.com/ipfs/go-log"
 	host "github.com/libp2p/go-libp2p-host"
 	peer "github.com/libp2p/go-libp2p-peer"
 	protocol "github.com/libp2p/go-libp2p-protocol"
@@ -32,24 +33,20 @@ var (
 	CacheDuration = 1 * time.Minute
 	// ClearCacheDuration 这个时间之后清理缓存？
 	ClearCacheDuration        = CacheDuration * 2
-	ParentPathDuration        = 30 * time.Second
-	WaitResponseTime          = 5 * time.Second //等待孩子节点的返回时间
-	PlumtreeHeartbeatInterval = 30 * time.Second
-	StepsOptimization         = true
+	WaitResponseTime          = 2 * time.Second //等待孩子节点的返回时间
+	PlumtreeHeartbeatInterval = 5 * time.Second
+	StepsOptimization         = false
 	StepOptThreshold          = 2 //跳数优化阈值，相差>2 需要优化
 )
 
 // NewPlumtreeRouter return an exposed PlumtreeRouter
 func NewPlumtreeRouter() *PlumtreeRouter {
 	rt := &PlumtreeRouter{
-		peers:        make(map[peer.ID]protocol.ID),
-		EagerPeers:   make(map[string]map[peer.ID]struct{}),
-		LazyPeers:    make(map[string]map[peer.ID]struct{}),
-		seenMessages: make(map[string]*cache.Cache), //cache.New(SeenMsgDuration, SeenMsgDuration*2),
-		CacheMessage: cache.New(CacheDuration, ClearCacheDuration),
-		//ChildrenData: make(map[peer.ID]*pb.Message),
+		peers:             make(map[peer.ID]protocol.ID),
+		EagerPeers:        make(map[string]map[peer.ID]struct{}),
+		LazyPeers:         make(map[string]map[peer.ID]struct{}),
+		CacheMessage:      cache.New(CacheDuration, ClearCacheDuration),
 		childrendataCache: cache.New(CacheDuration, ClearCacheDuration),
-		//CollectDone:  make(chan struct{}),
 		CollectDoneCache:  cache.New(CacheDuration, ClearCacheDuration),
 		fatherMap:         cache.New(CacheDuration, ClearCacheDuration),
 		TimeCost:          cache.New(CacheDuration, ClearCacheDuration),
@@ -57,6 +54,7 @@ func NewPlumtreeRouter() *PlumtreeRouter {
 		QueryIDCache:      cache.New(CacheDuration, ClearCacheDuration),
 		EagerReceivedTime: cache.New(CacheDuration, ClearCacheDuration),
 		proc:              &EmptyProcessor{},
+		log:               &loggerWithID{ZapEventLogger: log},
 	}
 	rt.heartbeatTimer() //开启定时任务
 	return rt
@@ -71,25 +69,21 @@ func NewPlumtreeSub(ctx context.Context, h host.Host, opts ...Option) (*PubSub, 
 //PlumtreeRouter 实现了PubSubRouter的接口, 从而可以使用Plumtree进行PubSub
 //需不需要HyparView? 似乎不需要
 type PlumtreeRouter struct {
-	p          *PubSub
-	proc       Processor
-	peers      map[peer.ID]protocol.ID // peer protocols
-	LazyPeers  map[string]map[peer.ID]struct{}
-	EagerPeers map[string]map[peer.ID]struct{}
-	//似乎并没有修改过这里的passivePeers
-	passivePeers map[peer.ID]struct{}
-	seenMessages map[string]*cache.Cache //topic->cachemap[msgID][msg]
-	CacheMessage *cache.Cache            //msgID->msg
-	fatherMap    *cache.Cache            //peer.ID
-	MapID2No     map[string]int
-	//ChildrenData     map[peer.ID]*pb.Message
+	p                 *PubSub
+	proc              Processor
+	peers             map[peer.ID]protocol.ID // peer protocols
+	LazyPeers         map[string]map[peer.ID]struct{}
+	EagerPeers        map[string]map[peer.ID]struct{}
+	CacheMessage      *cache.Cache //msgID->msg
+	fatherMap         *cache.Cache //peer.ID
+	MapID2No          map[string]int
 	childrendataCache *cache.Cache
 	CollectDoneCache  *cache.Cache
 	TimeCost          *cache.Cache
 	ResultCache       *cache.Cache
 	QueryIDCache      *cache.Cache
 	EagerReceivedTime *cache.Cache //msgID -> time stamp
-	//CollectDone  chan struct{}
+	log               *loggerWithID
 }
 
 // Protocols returns the list of protocols supported by the router.
@@ -101,17 +95,18 @@ func (pr *PlumtreeRouter) Protocols() []protocol.ID {
 // freshly initialized PubSub instance.
 func (pr *PlumtreeRouter) Attach(p *PubSub) {
 	pr.p = p
+	pr.log.pid = p.host.ID()
 }
 
 // AddPeer notifies the router that a new peer has been connected.
 func (pr *PlumtreeRouter) AddPeer(pid peer.ID, ptoid protocol.ID) {
-	log.Debugf("PEERUP: Add new peer %s using %s", pid, ptoid)
+	pr.log.Debugf("PEERUP: Add new peer %s using %s", pid, ptoid)
 	pr.peers[pid] = ptoid
 }
 
 // RemovePeer notifies the router that a peer has been disconnected.
 func (pr *PlumtreeRouter) RemovePeer(p peer.ID) {
-	log.Debugf("PEERDOWN: Remove disconnected peer %s", p)
+	pr.log.Debugf("PEERDOWN: Remove disconnected peer %s", p)
 	delete(pr.peers, p)
 	for _, peers := range pr.LazyPeers {
 		delete(peers, p)
@@ -134,25 +129,22 @@ func (pr *PlumtreeRouter) HandleRPC(rpc *RPC) {
 	if ctl == nil {
 		return
 	}
-	go func() {
-		pr.handlePrune(rpc.from, ctl)
-		iwant, graft := pr.handleIHave(rpc.from, ctl)
-		ihave := pr.handleIWant(rpc.from, ctl)
-		prune := pr.handleGraft(rpc.from, ctl)
-		if len(iwant) == 0 && len(graft) == 0 && len(ihave) == 0 && len(prune) == 0 {
-			return
-		}
-		out := rpcWithControl(ihave, nil, iwant, graft, prune)
-		pr.sendRPC(rpc.from, out)
-	}()
+	pr.handlePrune(rpc.from, ctl)
+	iwant, graft := pr.handleIHave(rpc.from, ctl)
+	ihave := pr.handleIWant(rpc.from, ctl)
+	prune := pr.handleGraft(rpc.from, ctl)
+	if len(iwant) == 0 && len(graft) == 0 && len(ihave) == 0 && len(prune) == 0 {
+		return
+	}
+	out := rpcWithControl(ihave, nil, iwant, graft, prune)
+	pr.sendRPC(rpc.from, out)
 }
 
 func (pr *PlumtreeRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) ([]*pb.ControlIWant, []*pb.ControlGraft) {
 	rTime := time.Now().Unix()
 	var iwant, graft []string
 	for _, iHave := range ctl.GetIhave() {
-		log.Debugf("%s node is handling ihave from %s", pr.getNoFromID(pr.p.host.ID().String()), pr.getNoFromID(p.String()))
-		log.Info("handling IHave")
+		pr.log.Debug("handling IHave")
 		topic := iHave.GetTopicID()
 		if _, ok := pr.p.topics[topic]; !ok {
 			return nil, nil
@@ -165,7 +157,7 @@ func (pr *PlumtreeRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) ([]*pb.
 			//500ms收不到消息ID对应的消息，需要主动请求
 			case <-time.After(500 * time.Millisecond):
 				if !pr.p.seenMessages.Has(msgID) {
-					log.Info("sending request to regain message, ", msgID)
+					pr.log.Info("sending request to regain message, ", msgID)
 					iwant = append(iwant, msgID)
 					graft = append(graft, topic)
 
@@ -175,7 +167,7 @@ func (pr *PlumtreeRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) ([]*pb.
 						// do nothing
 					} else {
 						//eager list does not contain this peer
-						log.Debugf("GRAFT: Add tree link from %s in %s", p, topic)
+						pr.log.Debugf("GRAFT: Add tree link from %s in %s", p, topic)
 						ePeers[p] = struct{}{}
 						pr.tagPeer(p, topic)
 						if _, ok := lPeers[p]; ok {
@@ -189,7 +181,7 @@ func (pr *PlumtreeRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) ([]*pb.
 					//消息的接收在IHAVE收到后的500ms内，或IHAVE之前
 					item, ok := pr.EagerReceivedTime.Get(msgID)
 					if !ok {
-						log.Warningf("%s message not in map ", msgID)
+						pr.log.Warningf("%s message not in map ", msgID)
 						continue
 					}
 					eRtime := item.(int64)
@@ -208,7 +200,7 @@ func (pr *PlumtreeRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) ([]*pb.
 						diff := *tmpMsg.QMsg.Steps - *iHave.Steps
 						if diff > int32(StepOptThreshold) {
 							graft = append(graft, topic)
-							log.Debugf("GRAFT: Add tree link from %s in %s", p, topic)
+							pr.log.Debugf("GRAFT: Add tree link from %s in %s", p, topic)
 							pr.EagerPeers[topic][p] = struct{}{}
 							pr.tagPeer(p, topic)
 							if _, ok := pr.LazyPeers[topic][p]; ok {
@@ -237,7 +229,7 @@ func (pr *PlumtreeRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) ([]*pb.
 
 func (pr *PlumtreeRouter) handlePrune(p peer.ID, ctl *pb.ControlMessage) {
 	for _, prune := range ctl.GetPrune() {
-		log.Info("handling Prune")
+		pr.log.Info("handling Prune")
 		topic := prune.GetTopicID()
 		if _, ok := pr.LazyPeers[topic]; !ok {
 			pr.LazyPeers[topic] = make(map[peer.ID]struct{})
@@ -245,8 +237,8 @@ func (pr *PlumtreeRouter) handlePrune(p peer.ID, ctl *pb.ControlMessage) {
 		peers, ok := pr.EagerPeers[topic]
 		lPeers := pr.LazyPeers[topic]
 		if ok {
-			log.Debugf("PRUNE : Remove Eager Link from %s to %s \n", pr.getNoFromID(p.String()), pr.getNoFromID(pr.p.host.ID().String()))
-			log.Debugf("PRUNE:Remove eager link to %s in %s", p, topic)
+			pr.log.Debugf("PRUNE : Remove Eager Link from %s to %s \n", pr.getNoFromID(p.String()), pr.getNoFromID(pr.p.host.ID().String()))
+			pr.log.Debugf("PRUNE:Remove eager link to %s in %s", p, topic)
 			delete(peers, p)
 			lPeers[p] = struct{}{}
 		}
@@ -256,7 +248,7 @@ func (pr *PlumtreeRouter) handlePrune(p peer.ID, ctl *pb.ControlMessage) {
 func (pr *PlumtreeRouter) handleGraft(p peer.ID, ctl *pb.ControlMessage) []*pb.ControlPrune {
 	var prune []string
 	for _, graft := range ctl.GetGraft() {
-		log.Info("handling graft")
+		pr.log.Info("handling graft")
 		topic := graft.GetTopicID()
 		_, ok := pr.p.topics[topic]
 		if !ok {
@@ -267,7 +259,7 @@ func (pr *PlumtreeRouter) handleGraft(p peer.ID, ctl *pb.ControlMessage) []*pb.C
 			if _, ok := ePeers[p]; ok {
 				// do nothing
 			} else {
-				log.Debugf("GRAFT: Add tree link from %s in %s", p, topic)
+				pr.log.Debugf("GRAFT: Add tree link from %s in %s", p, topic)
 				//eager list does not contain this peer
 				ePeers[p] = struct{}{}
 				pr.tagPeer(p, topic)
@@ -305,7 +297,7 @@ func (pr *PlumtreeRouter) handleIWant(p peer.ID, ctl *pb.ControlMessage) []*pb.M
 		return nil
 	}
 
-	log.Debugf("IWANT: Sending %d messages to %s", len(ihave), p)
+	pr.log.Infof("IWANT: Sending %d messages to %s", len(ihave), p)
 
 	msgs := make([]*pb.Message, 0, len(ihave))
 	for _, msg := range ihave {
@@ -341,7 +333,7 @@ func (pr *PlumtreeRouter) heartbeatTimer() {
 
 //定时将新邻居加入到Lazy Peers中,但是懒得定义一个新的Lazy_Graft消息，加到Eager Peers中也行
 func (pr *PlumtreeRouter) heartbeat() {
-	log.Info("plumtree heart beat")
+	pr.log.Debug("plumtree heart beat")
 	for _, topic := range pr.p.GetTopics() {
 		peers := pr.getPeers(topic, FanoutSize, func(peer.ID) bool {
 			return true
@@ -352,7 +344,7 @@ func (pr *PlumtreeRouter) heartbeat() {
 			_, ok1 := pr.EagerPeers[topic][pid]
 			_, ok2 := pr.LazyPeers[topic][pid]
 			if !ok1 && !ok2 {
-				log.Debugf("Heartbeat fix view: Add link to %s in %s", pid, topic)
+				pr.log.Debugf("Heartbeat fix view: Add link to %s in %s", pid, topic)
 				pr.EagerPeers[topic][pid] = struct{}{}
 				pr.tagPeer(pid, topic)
 				pr.sendGraft(pid, topic)
@@ -363,12 +355,11 @@ func (pr *PlumtreeRouter) heartbeat() {
 
 // Publish is invoked to forward a new message that has been validated.
 func (pr *PlumtreeRouter) Publish(from peer.ID, msg *pb.Message) {
-	log.Infof("received publish message from %s \n", pr.getNoFromID(from.String()))
-	log.Debugf("message id is : ", msgID(msg))
+	pr.log.Infof("publish: from=%s, msgid=%s", from.ShortString(), msgID(msg))
 	pr.EagerReceivedTime.Add(msgID(msg), time.Now().Unix(), CacheDuration)
 	for _, topic := range msg.GetTopicIDs() {
 		if pr.p.seenMessages.Has(msgID(msg)) {
-			log.Debugf("received this message before")
+			pr.log.Infof("seen msg: msgid=%s", msgID(msg))
 			pr.sendPrune(from, topic)
 			return
 		}
@@ -377,25 +368,23 @@ func (pr *PlumtreeRouter) Publish(from peer.ID, msg *pb.Message) {
 		tMessage := pb.TransferMessage{}
 		err := proto.Unmarshal(msg.Data, &tMessage)
 		if err != nil {
-			log.Fatal("received an unknown data type message")
-			panic(err)
+			pr.log.Fatal("received an unknown data type message")
+			return
 		}
 		if *tMessage.Type == pb.MessageType_RESPONSE {
-			log.Debugf("received a response message from children %s \n", pr.getNoFromID(from.String()))
+			pr.log.Debugf("received a response message from children %s \n", from.ShortString())
 			rid := tMessage.GetRMsg().GetRequestID()
 			if rid == "" {
-				log.Warning("invalid RequestID")
+				pr.log.Warning("invalid RequestID")
 			} else {
 				pr.getChildrenData(rid)[from] = msg
 			}
 			return
 		}
 		pr.cacheInit(msgID(msg), from)
-		log.Infof("%s node is publishing\n", pr.getNoFromID(pr.p.host.ID().String()))
-		log.Infof("waiting to response")
 		fatherID, ok := pr.fatherMap.Get(msgID(msg))
 		if !ok {
-			log.Fatalf("%s node has no father id", pr.p.host.ID().String())
+			pr.log.Fatalf("%s node has no father id", pr.p.host.ID().String())
 			panic(fmt.Sprintf("%s node has no father id", pr.p.host.ID().String()))
 		}
 		//感觉应该把等待返回结果的逻辑抽离出来,  但是不在这里做的话，又不知道究竟要等待哪些节点返回的结果
@@ -418,7 +407,7 @@ func (pr *PlumtreeRouter) Publish(from peer.ID, msg *pb.Message) {
 			nSteps = *tmpMsg.QMsg.Steps + 1
 			*tmpMsg.QMsg.Steps = nSteps
 			msg.Signature = nil //不设置为空，会不能广播，因为每次广播都要查看消息是否被修改
-			log.Debugf("new steps is : ", *tmpMsg.QMsg.Steps)
+			pr.log.Debugf("new steps is : ", *tmpMsg.QMsg.Steps)
 			msg.Data, _ = proto.Marshal(&tmpMsg)
 		}
 
@@ -428,7 +417,7 @@ func (pr *PlumtreeRouter) Publish(from peer.ID, msg *pb.Message) {
 				continue
 			}
 
-			log.Debugf("sending to peer : %s\n", pr.getNoFromID(pid.String()))
+			pr.log.Debugf("sending to peer : %s\n", pr.getNoFromID(pid.String()))
 			mch, ok := pr.p.peers[pid]
 			if !ok {
 				continue
@@ -436,7 +425,7 @@ func (pr *PlumtreeRouter) Publish(from peer.ID, msg *pb.Message) {
 			select {
 			case mch <- rpcWithMessages(msg):
 			default:
-				log.Infof("dropping message to peer %s :queue full", pid)
+				pr.log.Infof("dropping message to peer %s :queue full", pid)
 			}
 		}
 		//send message id to lazy peers
@@ -451,7 +440,7 @@ func (pr *PlumtreeRouter) Publish(from peer.ID, msg *pb.Message) {
 			select {
 			case mch <- rpcWithControl(nil, []*pb.ControlIHave{{TopicID: &topic, MessageIDs: []string{msgID(msg)}, Steps: &nSteps}}, nil, nil, nil):
 			default:
-				log.Infof("dropping lazy message to peer %s :queue full", pid)
+				pr.log.Infof("dropping lazy message to peer %s :queue full", pid)
 			}
 		}
 	}
@@ -464,26 +453,27 @@ func (pr *PlumtreeRouter) sendResponseToUser(topic string, msgID string) {
 	})
 	resp, err := pr.mergeResponse(msgID)
 	if resp == nil {
-		log.Warning("nil response")
+		// 目前我们并不关心response情况
+		pr.log.Debug("nil response: msgid=%s", msgID)
 	}
 	if err != nil {
-		log.Error(err.Error())
+		pr.log.Error(err.Error())
 	}
 	tmp, ok := pr.TimeCost.Get(msgID)
 	if !ok {
-		log.Errorf("cannot get time cost for %s", msgID)
+		pr.log.Errorf("cannot get time cost for %s", msgID)
 	}
-	log.Infof("Time cost is :%s \n", time.Now().Sub(tmp.(time.Time)))
+	pr.log.Infof("Time cost is :%s \n", time.Now().Sub(tmp.(time.Time)))
 
 	fatherNode, ok := pr.fatherMap.Get(msgID)
 	if !ok {
 		prompt := "node has no father in cache"
-		log.Fatal(prompt)
+		pr.log.Fatal(prompt)
 		panic(prompt)
 	}
 	if fatherNode.(peer.ID) != pr.p.host.ID() {
 		prompt := "current node is not root node"
-		log.Error(prompt)
+		pr.log.Error(prompt)
 	}
 	//把结果加入到 ResultCache 中，方便轮询（感觉可以改成 channel 的形式）
 	seqno := pr.p.nextSeqno()
@@ -507,10 +497,11 @@ func (pr *PlumtreeRouter) sendResponseToFather(topic string, msgID string) {
 	})
 	resp, err := pr.mergeResponse(msgID)
 	if resp == nil {
-		log.Warning("nil response")
+		// 目前我们并不关心response情况，先用debug级别
+		pr.log.Debug("nil response: msgid=%s", msgID)
 	}
 	if err != nil {
-		log.Fatal(err.Error())
+		pr.log.Fatal(err.Error())
 		return
 	}
 	seqno := pr.p.nextSeqno()
@@ -524,7 +515,7 @@ func (pr *PlumtreeRouter) sendResponseToFather(topic string, msgID string) {
 	}
 	fatherID, ok := pr.fatherMap.Get(msgID)
 	if !ok {
-		log.Fatalf("%s node has no father id\n", pr.p.host.ID().String())
+		pr.log.Fatalf("%s node has no father id\n", pr.p.host.ID().String())
 		panic(fmt.Sprintf("%s node has no father id\n", pr.p.host.ID().String()))
 	}
 	mch, ok := pr.p.peers[fatherID.(peer.ID)]
@@ -532,7 +523,8 @@ func (pr *PlumtreeRouter) sendResponseToFather(topic string, msgID string) {
 		return
 	}
 	mch <- rpcWithMessages(responseMsg)
-	pr.cacheClear(msgID)
+	// 这里先别删除缓存，如果超时后返回，还可以利用缓存返回东西
+	// pr.cacheClear(msgID)
 }
 
 //marshalResponse creates a marshalled response
@@ -548,8 +540,8 @@ func (pr *PlumtreeRouter) marshalResponse(msgID string, r Response) []byte {
 	}
 	bytes, err := proto.Marshal(&transMsg)
 	if err != nil {
-		log.Error(err.Error())
-		log.Error("marshall failed in marshalResponse")
+		pr.log.Error(err.Error())
+		pr.log.Error("marshall failed in marshalResponse")
 		return nil
 	}
 	return bytes
@@ -574,10 +566,10 @@ func (pr *PlumtreeRouter) waitMergeFinished(topic string, msgID string, conditio
 	select {
 	//感觉只要有一个节点超时，父节点肯定会超时。。。
 	case <-time.After(WaitResponseTime):
-		log.Infof("%s node time out \n", pr.getNoFromID(pr.p.host.ID().String()))
+		pr.log.Infof("time out: %s", msgID)
 		return
 	case <-pr.getCollectDone(msgID):
-		log.Infof("%s node collect done \n", pr.getNoFromID(pr.p.host.ID().String()))
+		pr.log.Infof("collect done: %s", msgID)
 		return
 	}
 }
@@ -616,6 +608,7 @@ func (pr *PlumtreeRouter) cacheClear(msgID string) {
 func (pr *PlumtreeRouter) getChildrenData(msgID string) map[peer.ID]*pb.Message {
 	tmp, ok := pr.childrendataCache.Get(msgID)
 	if !ok {
+		pr.log.Panicf("have no cache in ChildrenData for query message : %s", msgID)
 		panic(fmt.Sprintf("have no cache in ChildrenData for query message : %s", msgID))
 	}
 	return tmp.(map[peer.ID]*pb.Message)
@@ -649,7 +642,7 @@ func (pr *PlumtreeRouter) mergeResponse(msgID string) (Response, error) {
 	reqMsg, ok := pr.CacheMessage.Get(msgID)
 	if !ok {
 		prompt := fmt.Sprintf("cannot get msg cache for %s", msgID)
-		log.Fatal(prompt)
+		pr.log.Fatal(prompt)
 		return nil, errors.New(prompt)
 	}
 	childrenData := pr.getChildrenData(msgID)
@@ -696,7 +689,7 @@ func (pr *PlumtreeRouter) sendRPC(p peer.ID, out *RPC) {
 	select {
 	case mch <- out:
 	default:
-		log.Infof("dropping message to peer %s: queue full", p)
+		pr.log.Infof("dropping message to peer %s: queue full", p)
 		// push control messages that need to be retried
 		//TODO:cache graft, IHAVE to retry
 		//ctl := out.GetControl()
@@ -715,7 +708,7 @@ func (pr *PlumtreeRouter) Join(topic string) {
 	pmap := peerListToMap(peers)
 	pr.EagerPeers[topic] = pmap
 	for pid := range pmap {
-		log.Debugf("JOIN: Add link to %s in %s", pid, topic)
+		pr.log.Debugf("JOIN: Add link to %s in %s", pid, topic)
 		pr.tagPeer(pid, topic)
 		pr.sendGraft(pid, topic)
 	}
@@ -860,12 +853,12 @@ func (pr *PlumtreeRouter) PublishRequest(r Request, topic string) (Response, err
 	msg, err := proto.Marshal(&transMsg)
 	if err != nil {
 		prompt := "publish marshal failed"
-		log.Panic(prompt, err.Error())
+		pr.log.Panic(prompt, err.Error())
 		panic(prompt)
 	}
 	err = pr.p.Publish(topic, msg)
 	if err != nil {
-		log.Error(err.Error())
+		pr.log.Error(err.Error())
 		return nil, err
 	}
 	var res Response
@@ -886,7 +879,7 @@ func (pr *PlumtreeRouter) PublishRequest(r Request, topic string) (Response, err
 			err = proto.UnmarshalMerge(responseMsg.(*pb.Message).Data, &tr)
 			if err != nil {
 				prompt := "unmarshal failed"
-				log.Error(prompt)
+				pr.log.Error(prompt)
 				return nil, errors.New(prompt)
 			}
 			res = pr.proc.ResponseUnserializer([]byte(tr.GetRMsg().GetResponse()))
@@ -894,7 +887,7 @@ func (pr *PlumtreeRouter) PublishRequest(r Request, topic string) (Response, err
 		}
 	}
 	prompt := "wait for response time out"
-	log.Error(prompt)
+	pr.log.Error(prompt)
 	return nil, errors.New(prompt)
 }
 
@@ -908,4 +901,59 @@ func generateUUID() string {
 		id = temp.String()
 	}
 	return id
+}
+
+type loggerWithID struct {
+	*logging.ZapEventLogger
+	pid peer.ID
+}
+
+func (l *loggerWithID) Debug(args ...interface{}) {
+	args = append([]interface{}{l.pid.ShortString(), ": "}, args...)
+	l.ZapEventLogger.Debug(args...)
+}
+func (l *loggerWithID) Debugf(format string, args ...interface{}) {
+	args = append([]interface{}{l.pid.ShortString()}, args...)
+	l.ZapEventLogger.Debugf("%s: "+format, args...)
+}
+func (l *loggerWithID) Error(args ...interface{}) {
+	args = append([]interface{}{l.pid.ShortString(), ": "}, args...)
+	l.ZapEventLogger.Error(args...)
+}
+func (l *loggerWithID) Errorf(format string, args ...interface{}) {
+	args = append([]interface{}{l.pid.ShortString()}, args...)
+	l.ZapEventLogger.Errorf("%s: "+format, args...)
+}
+func (l *loggerWithID) Fatal(args ...interface{}) {
+	args = append([]interface{}{l.pid.ShortString(), ": "}, args...)
+	l.ZapEventLogger.Fatal(args...)
+}
+func (l *loggerWithID) Fatalf(format string, args ...interface{}) {
+	args = append([]interface{}{l.pid.ShortString()}, args...)
+	l.ZapEventLogger.Fatalf("%s: "+format, args...)
+}
+func (l *loggerWithID) Info(args ...interface{}) {
+	args = append([]interface{}{l.pid.ShortString(), ": "}, args...)
+	l.ZapEventLogger.Info(args...)
+}
+func (l *loggerWithID) Infof(format string, args ...interface{}) {
+	args = append([]interface{}{l.pid.ShortString()}, args...)
+	l.ZapEventLogger.Infof("%s: "+format, args...)
+}
+
+func (l *loggerWithID) Panic(args ...interface{}) {
+	args = append([]interface{}{l.pid.ShortString(), ": "}, args...)
+	l.ZapEventLogger.Panic(args...)
+}
+func (l *loggerWithID) Panicf(format string, args ...interface{}) {
+	args = append([]interface{}{l.pid.ShortString()}, args...)
+	l.ZapEventLogger.Panicf("%s: "+format, args...)
+}
+func (l *loggerWithID) Warn(args ...interface{}) {
+	args = append([]interface{}{l.pid.ShortString(), ": "}, args...)
+	l.ZapEventLogger.Warn(args...)
+}
+func (l *loggerWithID) Warnf(format string, args ...interface{}) {
+	args = append([]interface{}{l.pid.ShortString()}, args...)
+	l.ZapEventLogger.Warnf("%s: "+format, args...)
 }

@@ -8,7 +8,8 @@ require (
 	github.com/ipfs/go-cid v0.0.7
 	github.com/ipfs/go-ipfs-addr v0.0.1
 	github.com/ipfs/go-log v1.0.4
-	github.com/libp2p/go-libp2p v0.11.0 // indirect
+	github.com/libp2p/go-libp2p v0.11.0
+	github.com/libp2p/go-libp2p-core v0.6.1
 	github.com/libp2p/go-libp2p-crypto v0.1.0
 	github.com/libp2p/go-libp2p-host v0.1.0
 	github.com/libp2p/go-libp2p-kad-dht v0.10.0

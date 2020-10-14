@@ -9,10 +9,14 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"sync"
 	"time"
 
+	"github.com/gogo/protobuf/proto"
 	pubsub "github.com/huiscool/p2p-experiments/pkg/pubsub"
+	pb "github.com/huiscool/p2p-experiments/pkg/pubsub/pb"
 	logging "github.com/ipfs/go-log"
+	uuid "github.com/nu7hatch/gouuid"
 
 	crypto "github.com/libp2p/go-libp2p-core/crypto"
 	host "github.com/libp2p/go-libp2p-core/host"
@@ -26,28 +30,32 @@ var (
 	Num *int
 	// Fanout -- 节点出度
 	Fanout *int
-	// Concurrent -- 并发广播数
+	// Concurrent -- 并发广播节点数
 	Concurrent *int
 	// Latency -- 延迟(以毫秒计算)
 	Latency *int
+	// Round -- 广播次数
+	Round *int
+	// Interval -- 广播时间间隔(以毫秒计算)
+	Interval *int
 )
 
 var (
-	log = logging.Logger("main")
+	log   = logging.Logger("main")
+	topic = "test-topic"
+	data  = []byte{1, 2, 3}
 )
 
 // global network
 var (
 	mnet  mocknet.Mocknet
-	nodes map[string]Node
+	nodes map[peer.ID]Node
 )
 
 // Node .
 type Node struct {
 	Host   host.Host
 	PubSub *pubsub.PubSub
-
-	// statistic
 }
 
 func main() {
@@ -59,16 +67,22 @@ func main() {
 	Fanout = flag.Int("fanout", 3, "")
 	Concurrent = flag.Int("curr", 1, "")
 	Latency = flag.Int("latency", 50, "")
+	Round = flag.Int("round", 10, "")
+	Interval = flag.Int("interval", 100, "")
 	flag.Parse()
 
 	logging.SetLogLevel("main", "info")
+	logging.SetLogLevel("pubsub", "info")
 
 	// GenNet
 	GenNet(*Num, *Fanout, *Latency)
 
 	// Run
+	Run(*Concurrent, *Round, *Interval)
 
 	// Print Statistics
+
+	select {}
 
 }
 
@@ -80,7 +94,7 @@ func GenNet(num int, fanout int, latency int) {
 		Latency: time.Duration(latency) * time.Millisecond,
 	})
 
-	nodes = make(map[string]Node)
+	nodes = make(map[peer.ID]Node)
 	for i := 0; i < num; i++ {
 		h, err := GenPeerWithMarshalablePrivKey(mnet)
 		if err != nil {
@@ -90,7 +104,7 @@ func GenNet(num int, fanout int, latency int) {
 		if err != nil {
 			panic(err)
 		}
-		nodes[h.ID().String()] = Node{
+		nodes[h.ID()] = Node{
 			Host:   h,
 			PubSub: psub,
 		}
@@ -119,6 +133,59 @@ func GenNet(num int, fanout int, latency int) {
 		totalFanout += len(mnet.Net(peerid).Peers())
 	}
 	log.Infof("average fanout: %f", float32(totalFanout)/float32(len(allpeers)))
+
+	// subscribe for test topic
+	for _, pid := range allpeers {
+		psub := nodes[pid].PubSub
+		_, err := psub.Subscribe(topic)
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	time.Sleep(10 * time.Second)
+}
+
+// Run function activates several goroutine to work.
+func Run(concurrent int, round int, interval int) {
+	senders := pickupPeersButMyself(peer.ID(""), concurrent, mnet.Peers())
+	log.Info(senders)
+	var wg sync.WaitGroup
+	wg.Add(len(senders))
+	for _, pid := range senders {
+		go Work(&wg, pid, round, interval)
+	}
+	wg.Wait()
+	log.Info("run ok")
+}
+
+// Work function performs concurrent broadcast for several rounds.
+func Work(wg *sync.WaitGroup, pid peer.ID, round int, interval int) {
+	psub := nodes[pid].PubSub
+	//marshal request
+	innerMsgID := generateUUID()
+	reqStep := int32(0)
+	transMsg := &pb.TransferMessage{
+		Type:    pb.MessageType_REQUEST.Enum(),
+		InnerId: &innerMsgID,
+		QMsg: &pb.QueryMessage{
+			Steps:   &reqStep,
+			Request: data,
+		},
+	}
+	bin, err := proto.Marshal(transMsg)
+	if err != nil {
+		panic(err)
+	}
+	for i := 0; i < round; i++ {
+		err = psub.Publish(topic, bin)
+		if err != nil {
+			panic(err)
+		}
+		time.Sleep(time.Duration(interval) * time.Millisecond)
+	}
+
+	wg.Done()
 }
 
 /*===========================================================================*/
@@ -173,4 +240,16 @@ func GenPeerWithMarshalablePrivKey(mn mocknet.Mocknet) (host.Host, error) {
 	}
 
 	return h, nil
+}
+
+func generateUUID() string {
+	var id string
+	temp, err := uuid.NewV4()
+	if err != nil {
+		log.Fatal("generate uuid failed")
+		id = "abcde"
+	} else {
+		id = temp.String()
+	}
+	return id
 }

@@ -1,15 +1,21 @@
 package statistic
 
-type Counter int
+import "sync/atomic"
 
-func NewCounter() Counter {
-	return Counter(0)
+type Counter struct {
+	val int32
 }
 
-func (c Counter) AddOne() {
-	c++
+func NewCounter() *Counter {
+	return &Counter{
+		val: 0,
+	}
 }
 
-func (c Counter) Value() int {
-	return int(c)
+func (c *Counter) AddOne() {
+	atomic.AddInt32(&c.val, 1)
+}
+
+func (c *Counter) Value() int {
+	return int(c.val)
 }
