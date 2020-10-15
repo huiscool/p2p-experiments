@@ -3,7 +3,7 @@ package pubsub
 import (
 	"fmt"
 
-	pb "github.com/huiscool/p2p-experiments/pkg/pubsub/pb"
+	pb "github.com/huiscool/p2p-experiments/pkg/plumtree/pb"
 
 	crypto "github.com/libp2p/go-libp2p-crypto"
 	peer "github.com/libp2p/go-libp2p-peer"

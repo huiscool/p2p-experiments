@@ -1,11 +1,10 @@
-// 本程序用于仿真测量EBT(Epidemic Broadcast Tree)在多点同时广播下的稳定性
+// 本程序用于仿真比较不同广播查询方式在不同节点数、出度、并发度下的平均跳数、最大跳数、回收的包数、回收时间、传输的数据量
 
 package main
 
 import (
 	"context"
 	crand "crypto/rand"
-	"encoding/binary"
 	"flag"
 	"fmt"
 	"math/rand"
@@ -13,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	pubsub "github.com/huiscool/p2p-experiments/pkg/pubsub"
+	pubsub "github.com/huiscool/p2p-experiments/pkg/plumtree"
 	logging "github.com/ipfs/go-log"
 
 	crypto "github.com/libp2p/go-libp2p-core/crypto"
@@ -25,23 +24,26 @@ import (
 
 var (
 	// Num -- 节点总数
-	Num *int
+	Num = flag.Int("num", 20, "")
 	// Fanout -- 节点出度
-	Fanout *int
+	Fanout = flag.Int("fanout", 3, "")
 	// Concurrent -- 并发广播节点数
-	Concurrent *int
+	Concurrent = flag.Int("concurrent", 1, "")
 	// Latency -- 延迟(以毫秒计算)
-	Latency *int
+	Latency = flag.Int("latency", 50, "")
 	// Round -- 广播次数
-	Round *int
+	Round = flag.Int("round", 10, "")
 	// Interval -- 广播时间间隔(以毫秒计算)
-	Interval *int
+	Interval = flag.Int("interval", 100, "")
+	// Method -- 广播方式
+	Method = flag.String("method", "baseline", "")
+	// Seed -- 随机数种子
+	Seed = flag.Int64("seed", time.Now().UnixNano(), "")
 )
 
 var (
 	log   = logging.Logger("main")
 	topic = "test-topic"
-	data  = []byte{1, 2, 3}
 )
 
 // global network
@@ -57,62 +59,13 @@ type Node struct {
 	Router *pubsub.PlumtreeRouter
 }
 
-// Processor .
-type Processor struct{}
-type Request = pubsub.Request
-type Response = pubsub.Response
-
-//RequestSerializer is invoked before publishing
-func (p *Processor) RequestSerializer(r Request) []byte {
-	out := make([]byte, 8)
-	binary.BigEndian.PutUint64(out, r.(uint64))
-	return out
-}
-
-//RequestUnserializer is invoked when a host receive Request
-func (p *Processor) RequestUnserializer(stream []byte) Request {
-	return binary.BigEndian.Uint64(stream)
-}
-
-//ResponseSerializer .
-func (p *Processor) ResponseSerializer(r Response) []byte {
-	out := make([]byte, 8)
-	binary.BigEndian.PutUint64(out, r.(uint64))
-	return out
-}
-
-//ResponseUnserializer .
-func (p *Processor) ResponseUnserializer(stream []byte) Response {
-	return binary.BigEndian.Uint64(stream)
-}
-
-//RequestHandler deals with the request. Each host with get the same request.
-func (p *Processor) RequestHandler(r Request) Response {
-	return uint64(1)
-}
-
-//MergeResponseHandler tells the fetcher how to merge responses which contains local response. It is invoked when the host received all its children's responses.
-func (p *Processor) MergeResponseHandler(res []Response) Response {
-	out := uint64(0)
-	for _, r := range res {
-		out += r.(uint64)
-	}
-	return out
-}
-
 func main() {
-
-	// set random seed
-	rand.Seed(int64(time.Now().UnixNano()))
-
-	Num = flag.Int("num", 20, "")
-	Fanout = flag.Int("fanout", 3, "")
-	Concurrent = flag.Int("concurrent", 1, "")
-	Latency = flag.Int("latency", 50, "")
-	Round = flag.Int("round", 10, "")
-	Interval = flag.Int("interval", 100, "")
 	flag.Parse()
 
+	// set random seed
+	rand.Seed(*Seed)
+
+	// set log level
 	logging.SetLogLevel("main", "info")
 	logging.SetLogLevel("pubsub", "warn")
 
@@ -205,22 +158,6 @@ func Run(concurrent int, round int, interval int) {
 	}
 	wg.Wait()
 	log.Info("run ok")
-}
-
-// Work function performs concurrent broadcast for several rounds.
-func Work(wg *sync.WaitGroup, pid peer.ID, round int, interval int) {
-	rt := nodes[pid].Router
-
-	for i := 0; i < round; i++ {
-		resp, err := rt.PublishRequest(uint64(0), topic)
-		if err != nil {
-			panic(err)
-		}
-		log.Info(pid.ShortString(), ": recv ", resp.(uint64))
-		time.Sleep(time.Duration(interval) * time.Millisecond)
-	}
-
-	wg.Done()
 }
 
 /*===========================================================================*/

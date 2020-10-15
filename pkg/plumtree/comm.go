@@ -5,7 +5,7 @@ import (
 	"context"
 	"io"
 
-	pb "github.com/huiscool/p2p-experiments/pkg/pubsub/pb"
+	pb "github.com/huiscool/p2p-experiments/pkg/plumtree/pb"
 
 	ggio "github.com/gogo/protobuf/io"
 	proto "github.com/gogo/protobuf/proto"

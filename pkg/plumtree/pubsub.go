@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	pb "github.com/huiscool/p2p-experiments/pkg/pubsub/pb"
+	pb "github.com/huiscool/p2p-experiments/pkg/plumtree/pb"
 
 	logging "github.com/ipfs/go-log"
 	crypto "github.com/libp2p/go-libp2p-core/crypto"
